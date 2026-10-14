@@ -1,0 +1,354 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: rec_engine_postgres
+    environment:
+      POSTGRES_USER: recengine
+      POSTGRES_PASSWORD: recengine_password
+      POSTGRES_DB: recommendation_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/core/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - rec_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recengine"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: rec_engine_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - rec_network
+    command: --grpc_port 6334 --rest_port 6333
+
+  # Kafka Broker
+  kafka:
+    image: apache/kafka:3.6.0
+    container_name: rec_engine_kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_HOST://localhost:9092,PLAINTEXT://kafka:9092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - rec_network
+    healthcheck:
+      test: echo 'foo' | nc localhost 9092
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Zookeeper (required for older Kafka versions)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rec_engine_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - rec_network
+
+  # Redis for caching and feature store online store
+  redis:
+    image: redis:7-alpine
+    container_name: rec_engine_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - rec_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MLflow Model Registry
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: rec_engine_mlflow
+    ports:
+      - "5000:5000"
+    command: >
+      bash -c "mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --default-artifact-root /var/lib/mlflow/artifacts
+      --backend-store-uri sqlite:///var/lib/mlflow/mlflow.db"
+    volumes:
+      - mlflow_data:/var/lib/mlflow
+    networks:
+      - rec_network
+
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rec_engine_backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://recengine:recengine_password@postgres:5432/recommendation_db
+      REDIS_URL: redis://redis:6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      QDRANT_URL: http://qdrant:6333
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      FEAST_OFFLINE_STORE: parquet
+      FEAST_ONLINE_STORE: redis
+      ENVIRONMENT: development
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - qdrant
+      - mlflow
+    networks:
+      - rec_network
+    volumes:
+      - ./backend:/app
+      - mlflow_data:/var/lib/mlflow/artifacts
+
+  # Feature Store Service (Feast)
+  feast:
+    build:
+      context: ./feature_store
+      dockerfile: Dockerfile
+    container_name: rec_engine_feast
+    environment:
+      DATABASE_URL: postgresql://recengine:recengine_password@postgres:5432/recommendation_db
+      REDIS_URL: redis://redis:6379
+      SPARK_MASTER: spark-master:7077
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - rec_network
+
+  # Frontend Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rec_engine_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_QDRANT_URL: http://localhost:6333
+      NEXT_PUBLIC_ENVIRONMENT: development
+    depends_on:
+      - backend
+    networks:
+      - rec_network
+
+  # Kafka Producers
+  kafka-producer:
+    build:
+      context: ./kafka/producers
+      dockerfile: Dockerfile
+    container_name: rec_engine_kafka_producer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      TOPIC_PREFIX: rec_events
+    depends_on:
+      - kafka
+    networks:
+      - rec_network
+    restart: unless-stopped
+
+  # Kafka Consumers
+  kafka-consumer:
+    build:
+      context: ./kafka/consumers
+      dockerfile: Dockerfile
+    container_name: rec_engine_kafka_consumer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: recommendation_group
+    depends_on:
+      - kafka
+      - backend
+    networks:
+      - rec_network
+    restart: unless-stopped
+
+  # ML Training Pipeline
+  ml-training:
+    build:
+      context: ./ml/training
+      dockerfile: Dockerfile
+    container_name: rec_engine_training
+    environment:
+      DATABASE_URL: postgresql://recengine:recengine_password@postgres:5432/recommendation_db
+      REDIS_URL: redis://redis:6379
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      QDRANT_URL: http://qdrant:6333
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - qdrant
+      - mlflow
+    networks:
+      - rec_network
+
+  # Inference Service
+  inference:
+    build:
+      context: ./ml/inference
+      dockerfile: Dockerfile
+    container_name: rec_engine_inference
+    ports:
+      - "8001:8000"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      CACHE_TTL: 300
+    depends_on:
+      - qdrant
+      - mlflow
+      - redis
+    networks:
+      - rec_network
+
+  # Apache Spark Master
+  spark-master:
+    image: bitnami/spark:3.4
+    container_name: rec_engine_spark_master
+    ports:
+      - "8080:8080"
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: no
+      SPARK_RPC_ENCRYPTION_ENABLED: no
+      SPARK_LOCAL_STORAGE_ENCRYPTION: no
+      SPARK_SSL_ENABLED: no
+    networks:
+      - rec_network
+
+  # Apache Spark Worker
+  spark-worker:
+    image: bitnami/spark:3.4
+    container_name: rec_engine_spark_worker
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 4g
+    depends_on:
+      - spark-master
+    networks:
+      - rec_network
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: rec_engine_airflow_scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://airflow:airflow@postgres:5432/airflow_db
+      AIRFLOW__REDSHIFT__HOST: localhost
+    depends_on:
+      - postgres
+      - spark-master
+    networks:
+      - rec_network
+
+  # Airflow Webserver
+  airflow-webserver:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: rec_engine_airflow_webserver
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://airflow:airflow@postgres:5432/airflow_db
+    depends_on:
+      - airflow-scheduler
+    networks:
+      - rec_network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rec_engine_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - rec_network
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rec_engine_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: grafana-piechart-panel,grafana-clock-panel
+    volumes:
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - rec_network
+
+networks:
+  rec_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  kafka_data:
+  redis_data:
+  mlflow_data:
+  prometheus_data:
+  grafana_data:
